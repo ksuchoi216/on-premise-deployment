@@ -6,7 +6,7 @@ WORKDIR /app
 RUN pip install --no-cache-dir uv
 
 # Install dependencies first for better caching
-COPY requirements.txt .
+COPY app/requirements.txt .
 RUN uv pip install --system --no-cache -r requirements.txt
 
 # Copy application code

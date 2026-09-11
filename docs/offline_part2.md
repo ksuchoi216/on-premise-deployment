@@ -6,7 +6,7 @@
 
 ```text
 offline-fastapi:1.0.0
-postgres:17
+postgres:15
 ```
 
 확인:
@@ -20,7 +20,7 @@ Docker image를 archive로 저장한다.
 ```bash
 docker save \
   offline-fastapi:1.0.0 \
-  postgres:17 \
+  postgres:15 \
   -o images.tar
 ```
 
@@ -57,9 +57,11 @@ offline-demo-1.0.0/
 `.env.example`
 
 ```env
-POSTGRES_USER=app
-POSTGRES_PASSWORD=change-me
-POSTGRES_DB=app
+POSTGRES_USER=admin
+POSTGRES_PASSWORD=your_password_here
+POSTGRES_DB=offline_db
+POSTGRES_PORT=5432
+API_PORT=8000
 ```
 
 ---
@@ -146,22 +148,22 @@ Health check
 
 ```bash
 tar -czf \
-  offline-demo-1.0.0.tar.gz \
-  offline-demo-1.0.0/
+  deployment/offline-demo-1.0.0.tar.gz \
+  -C deployment offline-demo-1.0.0
 ```
 
 또는 zstd를 사용할 수 있다.
 
 ```bash
 tar -I zstd \
-  -cf offline-demo-1.0.0.tar.zst \
-  offline-demo-1.0.0/
+  -cf deployment/offline-demo-1.0.0.tar.zst \
+  -C deployment offline-demo-1.0.0
 ```
 
 최종 산출물:
 
 ```text
-offline-demo-1.0.0.tar.zst
+deployment/offline-demo-1.0.0.tar.gz
 ```
 
 이 파일이 고객사 또는 폐쇄망으로 전달되는 release artifact가 된다.
@@ -269,7 +271,7 @@ PyPI 접근 없음
 
 ---
 
-# 17. build-bundle.sh 자동화
+# 17. deploy.sh 자동화
 
 수동 작업이 성공하면 bundle 생성 과정을 script로 만든다.
 
@@ -277,56 +279,50 @@ PyPI 접근 없음
 
 ```bash
 #!/usr/bin/env bash
-
 set -euo pipefail
 
+# 스크립트가 위치한 디렉터리(demo) 기준
+cd "$(dirname "$0")"
 
 VERSION="1.0.0"
-BUNDLE_DIR="offline-demo-${VERSION}"
+BUNDLE_NAME="offline-demo-${VERSION}"
+BUNDLE_DIR="deployment/${BUNDLE_NAME}"
 
+echo "[1/5] Building images..."
+# docker 폴더 안의 compose 파일을 사용하여 빌드
+docker compose -f docker/docker-compose.yml build
 
-echo "[1/5] Building images"
-
-docker compose build
-
-
-echo "[2/5] Preparing bundle"
-
+echo "[2/5] Preparing bundle directory..."
 rm -rf "${BUNDLE_DIR}"
 mkdir -p "${BUNDLE_DIR}"
 
-
-echo "[3/5] Exporting images"
-
+echo "[3/5] Exporting Docker images to tar..."
 docker save \
-  offline-demo-backend:${VERSION} \
-  postgres:17 \
+  offline-fastapi:${VERSION} \
+  postgres:15 \
   -o "${BUNDLE_DIR}/images.tar"
 
-
-echo "[4/5] Copying deployment files"
-
-cp docker-compose.yml "${BUNDLE_DIR}/"
-cp offline/install.sh "${BUNDLE_DIR}/"
-cp .env.example "${BUNDLE_DIR}/"
-
+echo "[4/5] Copying deployment files..."
+# docker 폴더 안에 있는 파일들을 번들 폴더로 복사
+cp docker/docker-compose.yml "${BUNDLE_DIR}/"
+cp docker/install.sh "${BUNDLE_DIR}/"
+cp docker/.env.example "${BUNDLE_DIR}/"
 echo "${VERSION}" > "${BUNDLE_DIR}/VERSION"
 
+echo "[5/5] Creating final archive (.tar.gz)..."
+# 압축 파일 내부에 deployment/ 폴더가 포함되지 않고 알맹이만 나오도록 -C 옵션 사용
+tar -czf "deployment/${BUNDLE_NAME}.tar.gz" -C deployment "${BUNDLE_NAME}"
 
-echo "[5/5] Creating archive"
+# (선택) 포장 후 남은 찌꺼기 폴더 삭제
+rm -rf "${BUNDLE_DIR}"
 
-tar -I zstd \
-  -cf "${BUNDLE_DIR}.tar.zst" \
-  "${BUNDLE_DIR}"
-
-
-echo "Bundle created: ${BUNDLE_DIR}.tar.zst"
+echo "✅ Bundle successfully created: $(pwd)/deployment/${BUNDLE_NAME}.tar.gz"
 ```
 
 최종적으로 release build는 다음 명령 하나로 수행하는 것을 목표로 한다.
 
 ```bash
-./offline/build-bundle.sh
+./deploy.sh
 ```
 
 ---
@@ -364,8 +360,8 @@ Harbor는 폐쇄망 내부의 private OCI registry 역할을 한다.
 예:
 
 ```text
-harbor.internal/myapp/backend:1.0.0
-harbor.internal/infra/postgres:17
+harbor.internal/myapp/offline-fastapi:1.0.0
+harbor.internal/infra/postgres:15
 ```
 
 역할:
@@ -536,7 +532,7 @@ Kubernetes에서는 Docker Hub가 아니라 Harbor image를 사용한다.
 
 ```yaml
 image:
-  repository: harbor.internal/myapp/backend
+  repository: harbor.internal/myapp/offline-fastapi
   tag: "1.0.0"
 ```
 
@@ -545,7 +541,7 @@ PostgreSQL:
 ```yaml
 image:
   repository: harbor.internal/infra/postgres
-  tag: "17"
+  tag: "15"
 ```
 
 ---
@@ -716,13 +712,13 @@ Kubernetes
 최종적으로 외부 환경에서:
 
 ```bash
-./offline/build-bundle.sh
+./deploy.sh
 ```
 
 을 실행하면:
 
 ```text
-offline-demo-1.0.0.tar.zst
+deployment/offline-demo-1.0.0.tar.gz
 ```
 
 가 생성되어야 한다.

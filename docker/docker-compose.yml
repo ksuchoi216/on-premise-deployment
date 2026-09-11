@@ -19,6 +19,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+    image: offline-fastapi:1.0.0
     ports:
       - "${API_PORT:-8000}:8000"
     environment:

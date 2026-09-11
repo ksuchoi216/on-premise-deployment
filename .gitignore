@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Offline Bundles & Archives
+*.tar
+*.tar.gz
+*.tar.zst
