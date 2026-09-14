@@ -1,225 +1,112 @@
-# Harbor + kubeadm Kubernetes + Helm 폐쇄망 실습
+# kubeadm 클러스터 구성 → Harbor → 매니페스트 기반 온프레미스 배포
 
-이 문서는 기존 [Part 1](offline_part1.md), [Part 2](offline_part2.md)에서 만든 offline-fastapi:1.0.0, postgres:15, images.tar를 이용한다. 기존 k3s를 제거하고 kubeadm 기반 표준 Kubernetes에 Harbor를 설치한 뒤, Kubernetes YAML과 Helm Chart로 FastAPI/PostgreSQL을 운영한다.
+[공식 kubeadm 설치 가이드](https://kubernetes.io/ko/docs/setup/production-environment/tools/kubeadm/install-kubeadm/)로 **kubelet, kubeadm, kubectl을 설치한 다음 단계**부터 진행한다. [공식 클러스터 구성 가이드](https://kubernetes.io/ko/docs/setup/production-environment/tools/kubeadm/create-cluster-kubeadm/)의 순서에 맞춰 클러스터를 만들고, Harbor에 이미지를 등록한 뒤 FastAPI/PostgreSQL을 YAML로 배포한다.
 
-~~~
-인터넷 연결 준비 서버                         폐쇄망 대상 서버
-Kubernetes package + bootstrap image  ───→  kubeadm Kubernetes
-Flannel + local storage image          ───→  CNI / PVC
-Harbor Chart + Harbor image            ───→  Harbor
-images.tar                             ───→  Harbor → Kubernetes → Helm
-~~~
+온프레미스는 자체 서버에 배포한다는 뜻이며 반드시 폐쇄망을 뜻하지 않는다. 본문은 설치 시 외부 저장소에 접근할 수 있는 서버를 기준으로 한다. 외부 접속이 차단된 경우에는 **부록 A의 사전 반입을 먼저 수행**하고 본문의 다운로드 대신 반입 파일을 사용한다. 이미 설치한 Kubernetes 패키지를 다시 다운로드하거나 k3s를 삭제하는 절차는 필수가 아니다.
 
-## 1. 핵심 개념과 범위
+Harbor는 공식 Chart를 `helm template`으로 YAML로 변환한 뒤 `kubectl apply`로 설치한다. Helm은 매니페스트 생성에만 사용하며, 애플리케이션은 직접 작성한 Deployment/StatefulSet/Service/Secret 매니페스트로 관리한다. 파일명은 기존 링크 호환성을 위해 유지한다.
 
-| 구성 요소 | 역할 | 실습 선택 |
+## 1. 설치 상태 확인
+
+### 1.1 이 작업 환경에서 확인한 결과 (2026-09-14)
+
+| 항목 | 관찰 결과 | 판단 / 다음 작업 |
 | --- | --- | --- |
-| Docker | image를 load, tag, push | 기존 Docker 26 |
-| containerd | Kubernetes의 CRI runtime | Docker와 함께 설치된 containerd |
-| kubeadm | Kubernetes control plane 초기화 | 단일 control-plane node |
-| Flannel | Pod 네트워크(CNI) | Pod CIDR 10.244.0.0/16 |
-| local-path-provisioner | 로컬 디스크 PVC 동적 생성 | local-path StorageClass |
-| Harbor | 폐쇄망 OCI registry | TLS NodePort 30443 |
-| Helm | YAML template/package | FastAPI/PostgreSQL Chart |
+| OS | Ubuntu 20.04.6 LTS | 운영 OS 지원과 runtime 호환성은 별도 검토 |
+| kubeadm / kubelet / kubectl | 모두 `/usr/bin`, v1.37.0, 패키지 1.37.0-1.1 | 세 도구 설치 및 실행 확인 |
+| 패키지 버전 고정 | 세 패키지 모두 hold | 자동 변경 방지 설정 확인 |
+| kubelet | enabled, inactive (dead) | 서비스 시작 및 init 후 상태 확인 필요 |
+| containerd | 1.7.24, active | 프로세스는 실행 중 |
+| containerd 설정 | `disabled_plugins = ["cri"]` | Kubernetes용 CRI 활성화 필요 |
+| swap | `/dev/dm-1`, 976 MiB 활성 | 본 실습에서는 비활성화 필요 |
+| 현재 사용자 kubectl | kubeconfig 디렉터리 없음, localhost:8080 연결 거부 | 클러스터 접속 설정 없음; 클러스터 존재 여부 자체는 단정 불가 |
+| CRI 실제 응답 | sudo 암호 필요로 미확인 | 관리자 터미널에서 아래 crictl 실행 필요 |
 
-이 문서는 단일 서버 학습용이다. local-path PVC는 해당 서버 로컬 디스크에 있으므로 node 장애를 견디지 못한다. 실제 운영에는 공유 스토리지 또는 object storage, 조직 CA, DNS, backup, HA control plane이 필요하다.
+**바이너리 설치는 확인했지만 클러스터 실행 준비는 완료되지 않았다.** 이번 문서 수정 과정에서는 서비스 재시작, swap 변경, `kubeadm init`을 실행하지 않았다.
 
-## 2. 기존 k3s 제거
+### 1.2 각 노드에서 재확인할 명령
 
-> 경고: 다음 단계는 기존 k3s의 Pod, local datastore, local-path PV 데이터를 삭제한다. 보존할 데이터가 있다면 먼저 backup한다. Docker image와 images.tar은 삭제하지 않는다.
-
-먼저 현재 상태를 기록한다.
+아래 명령 예시는 Bash 기준이다. worker에서도 패키지/runtime/네트워크 준비를 반복한다.
 
 ~~~bash
-uname -a
-cat /etc/os-release
-df -h /
+command -v kubeadm kubelet kubectl
+kubeadm version -o short
+kubelet --version
+kubectl version --client
+dpkg-query -W kubeadm kubelet kubectl
+apt-mark showhold
+systemctl is-active kubelet containerd
+sudo journalctl -u kubelet -n 50 --no-pager
+sudo crictl --runtime-endpoint unix:///run/containerd/containerd.sock info
+swapon --show
+sudo ls -la /etc/kubernetes/manifests
+sudo test -f /etc/kubernetes/admin.conf && echo '기존 클러스터 설정 발견'
+~~~
+
+`kubectl version --client`는 클러스터 연결을 검사하지 않는다. `kubeadm init` 전 kubelet은 설정을 기다리며 재시작할 수 있으므로 이 현상만으로 패키지 설치 실패라고 판단하지 않는다. 다만 현재 관찰된 `inactive`는 실행 중 상태가 아니다. 기존 admin.conf 또는 static Pod 파일이 있으면 기존 클러스터 상태부터 확인하고 init을 반복하지 않는다.
+
+세 도구가 없거나 버전이 다른 경우에만 공식 설치 가이드의 **같은 minor 버전 저장소**를 사용해 원하는 패키지 버전을 선택한다. 현재 설치는 재설치할 필요가 없다.
+
+~~~bash
+# 복구가 필요한 경우에만: 저장소 설정 후 제공 버전을 먼저 확인
+apt-cache madison kubeadm kubelet kubectl
+# 아래 값은 현재 설치된 버전이며 저장소에 실제 존재하는지 먼저 확인한다.
+PACKAGE_VERSION='1.37.0-1.1'
+sudo apt-mark unhold kubeadm kubelet kubectl
+sudo apt-get install -y kubeadm="$PACKAGE_VERSION" kubelet="$PACKAGE_VERSION" kubectl="$PACKAGE_VERSION"
+sudo apt-mark hold kubeadm kubelet kubectl
+~~~
+
+## 2. 클러스터 사전 준비 (모든 노드)
+
+### 2.1 토폴로지와 네트워크
+
+현재 서버를 중앙 control-plane으로 사용하고, 추가 Linux PC를 worker로 연결한다. control-plane의 기본 NoSchedule taint를 유지하고 Harbor/PostgreSQL/FastAPI는 worker에 배치한다. 최소 한 대의 worker가 Ready가 된 뒤 storage와 Harbor 설치를 진행한다. PC가 Windows라면 이 Linux/containerd/Flannel 절차를 그대로 적용할 수 없으므로 Linux 설치 또는 브리지 네트워크의 Linux VM을 준비한다. local-path는 노드 로컬 디스크이므로 노드 장애 시 데이터 가용성을 제공하지 않는다. 운영에는 HA control-plane, CSI 스토리지, 백업/복구, 조직 DNS/CA가 필요하다.
+
+구체적인 서버 역할은 다음과 같다. SSH alias는 접속 편의 기능이며 Kubernetes 노드 이름을 설정하지 않는다. 두 서버의 실제 hostname이 서로 다른지 확인한다.
+
+| 역할 | 접속 | IP | 실행할 작업 |
+| --- | --- | --- | --- |
+| control-plane | `ssh99` 또는 `ssh ksuchoi216@192.168.0.99` | 192.168.0.99 | init, kubeconfig, CNI/스토리지/Harbor/앱 apply |
+| worker | `ssh98` 또는 `ssh ksuchoi216@192.168.0.98` | 192.168.0.98 | 패키지/runtime 준비, join, Harbor DNS/CA 등록 |
+
+192.168.0.98의 설치/서비스 상태는 아직 점검하지 않았다. 1절의 실제 점검 결과는 현재 접속한 192.168.0.99에 대한 것이다. 아래 1–2절 명령은 `ssh98`로 접속한 터미널에서도 실행하되 `kubeadm init`은 192.168.0.99에서만 실행한다.
+
+각 노드의 hostname/MAC/product UUID는 고유해야 한다. 고정 IP, 시간 동기화, CPU/메모리/디스크 여유를 확인한다. 특히 Harbor와 DB를 함께 실행할 자원과 이미지/PVC 저장 공간이 필요하다.
+
+| 통신 | 필요한 범위 |
+| --- | --- |
+| Kubernetes API TCP 6443 | 관리 PC와 노드 → control-plane |
+| etcd TCP 2379–2380 | control-plane 내부/상호 통신 |
+| kubelet TCP 10250 | control-plane → 노드 |
+| controller/scheduler TCP 10257/10259 | control-plane 내부 |
+| Flannel VXLAN UDP 8472 | 노드 사이, 외부 공개 금지 |
+| Harbor TCP 30443 / 앱 TCP 30800 | 허용된 사내 클라이언트 → 노드 |
+
+Pod CIDR `10.244.0.0/16`, Service CIDR `10.96.0.0/12`가 사내 LAN/VPN과 겹치지 않는지 확인한다. 겹치면 init 설정과 Flannel의 Network를 함께 변경한다. 방화벽 전체를 끄지 않고 필요한 통신만 허용한다.
+
+~~~bash
+ip -br address
+ip route
+hostnamectl
 free -h
-sudo docker version
-containerd --version
-helm version
-sudo k3s --version
-sudo k3s kubectl get nodes -o wide
-sudo k3s kubectl get all -A
-sudo k3s kubectl get pvc -A
-~~~
-
-정확히 RESET-K3S를 입력한 경우에만 제거한다.
-
-~~~bash
-read -r -p 'k3s의 Pod와 local PV 데이터가 삭제됩니다. RESET-K3S 입력: ' ANSWER
-[ "$ANSWER" = 'RESET-K3S' ] || { echo '취소했습니다.'; exit 1; }
-
-sudo /usr/local/bin/k3s-uninstall.sh
-
-sudo systemctl status k3s --no-pager || true
-sudo test ! -e /etc/rancher/k3s/k3s.yaml && echo 'k3s kubeconfig removed'
-sudo test ! -d /var/lib/rancher/k3s && echo 'k3s data directory removed'
-sudo docker images | rg 'offline-fastapi|postgres' || true
-~~~
-
-공식 참고: [k3s 제거](https://docs.k3s.io/installation/uninstall)
-
-## 3. 인터넷 연결 준비 서버: 반입 artifact 만들기
-
-이 절은 대상과 같은 Ubuntu 20.04 x86_64 준비 서버에서 실행한다. 대상 폐쇄망 서버에서는 외부 APT repository, Docker Hub, Helm repository에 접근하지 않는다.
-
-### 3.1 버전과 디렉터리 고정
-
-아래 버전은 예시다. 시작 전에 실제 release 존재 여부를 확인하고, 준비 서버와 대상 서버에서 같은 값을 사용한다.
-
-~~~bash
-export KUBERNETES_MINOR='v1.37'
-export KUBERNETES_VERSION='v1.37.0'
+df -h
+# 실제 control-plane의 고정 LAN IP로 반드시 바꾼다.
+export SERVER_IP='192.168.0.99'
+export LAB="$HOME/kubeadm-onprem-lab"
+mkdir -p "$LAB"/{manifests,charts,images,certs,app}
+export KUBERNETES_VERSION="$(kubeadm version -o short)"
 export FLANNEL_VERSION='v0.27.4'
 export LOCAL_PATH_VERSION='v0.0.36'
 export HARBOR_CHART_VERSION='1.18.0'
 export HARBOR_HOST='harbor.algo.local'
 export HARBOR_HTTPS_NODEPORT='30443'
-export BUNDLE="$PWD/offline-k8s-lab"
-
-mkdir -p "$BUNDLE"/{debs,images,charts,manifests,checksums}
-
-cat > "$BUNDLE/versions.env" <<EOF
-KUBERNETES_MINOR=$KUBERNETES_MINOR
-KUBERNETES_VERSION=$KUBERNETES_VERSION
-FLANNEL_VERSION=$FLANNEL_VERSION
-LOCAL_PATH_VERSION=$LOCAL_PATH_VERSION
-HARBOR_CHART_VERSION=$HARBOR_CHART_VERSION
-HARBOR_HOST=$HARBOR_HOST
-HARBOR_HTTPS_NODEPORT=$HARBOR_HTTPS_NODEPORT
-EOF
+cd "$LAB"
 ~~~
 
-### 3.2 Kubernetes package와 bootstrap image 준비
+변수는 같은 Bash 세션에서 사용한다. 새 터미널에서는 다시 설정한다. `k8s/versions.env`는 기존 준비 자료이며 이 문서는 실제 설치된 kubeadm 버전을 기준으로 한다. 애드온/Chart 버전은 고정 예시로, 사용 중인 Kubernetes와의 조합은 실제 배포 검증이 필요하다.
 
-Kubernetes APT repository는 minor version별로 분리된다. KUBERNETES_MINOR와 URL을 맞춘다.
-
-~~~bash
-sudo install -d -m 0755 /etc/apt/keyrings
-curl -fsSL "https://pkgs.k8s.io/core:/stable:/$KUBERNETES_MINOR/deb/Release.key" \
-  | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-
-echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/$KUBERNETES_MINOR/deb/ /" \
-  | sudo tee /etc/apt/sources.list.d/kubernetes.list
-
-sudo apt-get update
-sudo apt-get --download-only -y \
-  -o "Dir::Cache::archives=$BUNDLE/debs" \
-  install kubelet kubeadm kubectl kubernetes-cni cri-tools
-
-sudo apt-get install -y kubeadm
-kubeadm config images list --kubernetes-version "$KUBERNETES_VERSION" \
-  | tee "$BUNDLE/images/kubeadm-images.txt"
-~~~
-
-다운로드 전용 설치는 준비 서버에 이미 설치된 의존 package를 다시 받지 않을 수 있다. 대상과 같은 새 Ubuntu VM에서 bundle만으로 설치되는지 반드시 사전 검증한다.
-
-Flannel과 local storage manifest 및 image를 받는다.
-
-~~~bash
-curl -fL -o "$BUNDLE/manifests/kube-flannel.yml" \
-  "https://github.com/flannel-io/flannel/releases/download/$FLANNEL_VERSION/kube-flannel.yml"
-
-curl -fL -o "$BUNDLE/manifests/local-path-storage.yaml" \
-  "https://raw.githubusercontent.com/rancher/local-path-provisioner/$LOCAL_PATH_VERSION/deploy/local-path-storage.yaml"
-
-awk '/^[[:space:]]*image:/{gsub(/"/, "", $2); print $2}' \
-  "$BUNDLE"/manifests/*.yaml | sort -u \
-  | tee "$BUNDLE/images/addon-images.txt"
-
-cat "$BUNDLE/images/kubeadm-images.txt" "$BUNDLE/images/addon-images.txt" \
-  | sort -u > "$BUNDLE/images/kubernetes-bootstrap-images.txt"
-
-while read -r image; do sudo docker pull "$image"; done \
-  < "$BUNDLE/images/kubernetes-bootstrap-images.txt"
-
-sudo docker save -o "$BUNDLE/images/kubernetes-bootstrap-images.tar" \
-  $(cat "$BUNDLE/images/kubernetes-bootstrap-images.txt")
-~~~
-
-Flannel은 Pod network다. CNI 설치 전 CoreDNS가 Pending인 것은 정상이다. local-path-provisioner는 단일 node의 로컬 디스크에 PVC를 만든다.
-
-### 3.3 Harbor Chart와 Harbor image 준비
-
-Harbor가 아직 없으므로 Chart archive를 local file로 반입한다.
-
-~~~bash
-helm repo add harbor https://helm.goharbor.io
-helm repo update
-helm pull harbor/harbor --version "$HARBOR_CHART_VERSION" --destination "$BUNDLE/charts"
-
-cat > "$BUNDLE/manifests/harbor-values.yaml" <<EOF
-expose:
-  type: nodePort
-  tls:
-    enabled: true
-    certSource: secret
-    secret:
-      secretName: harbor-tls
-  nodePort:
-    ports:
-      http:
-        nodePort: 30080
-      https:
-        nodePort: $HARBOR_HTTPS_NODEPORT
-externalURL: https://$HARBOR_HOST:$HARBOR_HTTPS_NODEPORT
-persistence:
-  enabled: true
-  persistentVolumeClaim:
-    registry:
-      storageClass: local-path
-    jobservice:
-      storageClass: local-path
-trivy:
-  enabled: false
-harborAdminPassword: Harbor12345
-EOF
-
-helm template harbor "$BUNDLE/charts/harbor-$HARBOR_CHART_VERSION.tgz" \
-  --namespace harbor --values "$BUNDLE/manifests/harbor-values.yaml" \
-  > "$BUNDLE/manifests/harbor-rendered.yaml"
-
-awk '/^[[:space:]]*image:/{gsub(/"/, "", $2); print $2}' \
-  "$BUNDLE/manifests/harbor-rendered.yaml" | sort -u \
-  | tee "$BUNDLE/images/harbor-images.txt"
-
-while read -r image; do sudo docker pull "$image"; done \
-  < "$BUNDLE/images/harbor-images.txt"
-
-sudo docker save -o "$BUNDLE/images/harbor-images.tar" \
-  $(cat "$BUNDLE/images/harbor-images.txt")
-~~~
-
-Harbor12345는 실습용 초기 비밀번호다. 실제 운영에서는 Secret 또는 secret manager를 사용하고 설치 직후 변경한다. Trivy는 첫 설치의 image 수와 자원 사용량을 줄이기 위해 껐다.
-
-### 3.4 application image와 checksum 추가
-
-Part 2의 images.tar를 bundle에 복사한다.
-
-~~~bash
-cp /path/to/offline-demo-1.0.0/images.tar "$BUNDLE/images/images.tar"
-
-(cd "$BUNDLE" && find . -type f -print0 | sort -z | xargs -0 sha256sum) \
-  > "$BUNDLE/checksums/checksums.sha256"
-
-tar -C "$(dirname "$BUNDLE")" -czf offline-k8s-lab.tar.gz "$(basename "$BUNDLE")"
-~~~
-
-offline-k8s-lab.tar.gz를 대상 서버에 반입한다.
-
-## 4. 폐쇄망 대상 서버: kubeadm Kubernetes 설치
-
-대상 서버에서 artifact를 풀고 먼저 무결성을 확인한다.
-
-~~~bash
-tar -xzf offline-k8s-lab.tar.gz
-cd offline-k8s-lab
-sha256sum -c checksums/checksums.sha256
-source versions.env
-~~~
-
-### 4.1 containerd, swap, kernel 준비
+### 2.2 containerd, swap, kernel 준비
 
 Kubernetes 1.26 이상은 CRI v1 runtime을 요구한다. Linux containerd 기본 socket은 /run/containerd/containerd.sock이다.
 
@@ -233,7 +120,9 @@ sudo systemctl status containerd --no-pager
 sudo install -d -m 0755 /etc/containerd
 sudo cp -a /etc/containerd/config.toml \
   "/etc/containerd/config.toml.before-kubernetes.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
-sudo sh -c 'containerd config default > /etc/containerd/config.toml'
+containerd config default > /tmp/containerd-default.toml
+# 기본 설정은 참고용이다. 기존 config.toml의 필요한 항목만 sudoedit로 수정한다.
+sudoedit /etc/containerd/config.toml
 sudo rg -n 'disabled_plugins|SystemdCgroup|config_path' /etc/containerd/config.toml
 ~~~
 
@@ -254,12 +143,13 @@ containerd 2.x의 cgroup 설정 경로는 다음과 다르다.
   SystemdCgroup = true
 ~~~
 
-disabled_plugins에 cri가 있으면 제거한다. 수정 후 재시작하고 host networking 설정을 적용한다.
+현재 서버는 containerd 1.7.24이며 `disabled_plugins = ["cri"]`가 설정되어 있다. 이를 `disabled_plugins = []`로 바꾸고 위 1.x 테이블을 추가한다. 2.x에서는 registry 경로도 `[plugins."io.containerd.cri.v1.images".registry]`로 바뀌므로 해당 버전 설정을 사용한다. 수정 후 재시작하고 host networking 설정을 적용한다.
 
 ~~~bash
 sudo systemctl restart containerd
 sudo systemctl is-active containerd
 sudo ctr version
+sudo crictl --runtime-endpoint unix:///run/containerd/containerd.sock info
 
 swapon --show
 sudo swapoff -a
@@ -284,75 +174,151 @@ swapon --show
 
 마지막 swapon 출력은 비어 있어야 한다.
 
-### 4.2 반입 deb 설치와 control plane 초기화
+
+## 3. kubeadm으로 클러스터 생성
+
+### 3.1 control-plane에서 한 번만 초기화
+
+CRI 응답이 정상이고 swap이 꺼진 뒤 실행한다. Kubernetes 패키지 설치와 control-plane 컨테이너 이미지 준비는 별개다. `images pull`은 Kubernetes 구성 요소 이미지를 runtime에 받는 명령이다.
 
 ~~~bash
-sudo apt-get install -y --no-download ./debs/*.deb
-sudo apt-mark hold kubelet kubeadm kubectl
 sudo systemctl enable --now kubelet
+kubeadm config images list --kubernetes-version "$KUBERNETES_VERSION"
+# 인터넷 접근 가능할 때만. 폐쇄망은 부록 A의 image import로 대체한다.
+sudo kubeadm config images pull \
+  --kubernetes-version "$KUBERNETES_VERSION" \
+  --cri-socket unix:///run/containerd/containerd.sock
 
-sudo ctr -n k8s.io images import images/kubernetes-bootstrap-images.tar
-sudo ctr -n k8s.io images list
-
-SERVER_IP=$(hostname -I | awk '{print $1}')
 sudo kubeadm init \
   --kubernetes-version "$KUBERNETES_VERSION" \
   --apiserver-advertise-address "$SERVER_IP" \
   --cri-socket unix:///run/containerd/containerd.sock \
-  --pod-network-cidr 10.244.0.0/16
-~~~
+  --pod-network-cidr 10.244.0.0/16 \
+  --service-cidr 10.96.0.0/12
 
-마지막에 출력되는 kubeadm join 명령은 worker node 추가에 필요하다. token은 cluster join 권한이므로 안전하게 보관한다.
-
-~~~bash
 mkdir -p "$HOME/.kube"
-sudo cp /etc/kubernetes/admin.conf "$HOME/.kube/config"
+sudo cp -i /etc/kubernetes/admin.conf "$HOME/.kube/config"
 sudo chown "$(id -u):$(id -g)" "$HOME/.kube/config"
 chmod 600 "$HOME/.kube/config"
-
-kubectl get nodes
-kubectl get pods -A
+kubectl get nodes -o wide
 ~~~
 
-이때 node NotReady, CoreDNS Pending은 CNI가 없기 때문에 정상이다.
+HA로 확장할 계획이면 첫 init부터 `--control-plane-endpoint <공유-DNS>:6443`를 추가하고 접근 가능한 공유 엔드포인트/LB를 먼저 준비한다. admin.conf는 관리자 인증 정보다. 기존 kubeconfig를 덮어쓰지 않도록 확인한다.
 
-### 4.3 Flannel, local storage, 단일 node scheduling
+### 3.2 CNI 설치
+
+CNI는 한 종류만 설치한다. init 직후 NotReady/CoreDNS Pending이면 네트워크 설치를 진행한다.
 
 ~~~bash
+cd "$LAB"
+curl -fL -o manifests/kube-flannel.yml \
+  "https://raw.githubusercontent.com/flannel-io/flannel/$FLANNEL_VERSION/Documentation/kube-flannel.yml"
 kubectl apply -f manifests/kube-flannel.yml
-kubectl apply -f manifests/local-path-storage.yaml
-
-kubectl -n kube-flannel get pods -w
-kubectl -n local-path-storage get pods -w
 ~~~
 
-Pod가 Running이 되면 Ctrl+C로 watch를 끝낸다. 단일 서버에도 Harbor와 application Pod를 배치하도록 control-plane taint를 제거한다.
+### 3.3 추가 PC를 worker로 연결
+
+추가 PC마다 고유한 hostname과 고정 IP를 설정하고 1–2절을 수행한 뒤 init이 출력한 join 명령을 실행한다. 토큰이 만료되었으면 control-plane에서 다음 명령으로 새 join 명령을 받는다. 출력되는 토큰은 공유하지 않는다.
 
 ~~~bash
-kubectl taint nodes --all node-role.kubernetes.io/control-plane-
-kubectl patch storageclass local-path \
-  -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+# control-plane
+sudo kubeadm token create --print-join-command
+# worker: 실제 출력값으로 치환해 실행
+sudo kubeadm join 192.168.0.99:6443 --token <TOKEN> \
+  --discovery-token-ca-cert-hash sha256:<CA_HASH> \
+  --cri-socket unix:///run/containerd/containerd.sock
+~~~
 
+현재 구성에서는 control-plane taint를 제거하지 않는다. join 명령은 추가 PC에서, 이후 kubectl 명령은 control-plane의 일반 사용자 계정에서 실행한다. worker의 ROLES 열이 `<none>`이어도 정상이며 Ready 상태로 판단한다. 추가 PC에도 swap/CRI/cgroup/CNI 사전 준비와 Harbor DNS/CA 등록이 필요하다.
+
+~~~bash
+kubectl -n kube-flannel rollout status daemonset/kube-flannel-ds --timeout=5m
+kubectl wait --for=condition=Ready nodes --all --timeout=5m
+kubectl -n kube-system rollout status deployment/coredns --timeout=5m
 kubectl get nodes -o wide
 kubectl get pods -A
+~~~
+
+### 3.4 PVC용 StorageClass 설치
+
+~~~bash
+cd "$LAB"
+curl -fL -o manifests/local-path-storage.yaml \
+  "https://raw.githubusercontent.com/rancher/local-path-provisioner/$LOCAL_PATH_VERSION/deploy/local-path-storage.yaml"
+# helper Pod 이미지도 고정한다.
+sed -i 's|image: docker.io/library/busybox$|image: docker.io/library/busybox:1.37.0|' manifests/local-path-storage.yaml
+kubectl apply -f manifests/local-path-storage.yaml
+kubectl -n local-path-storage rollout status deployment/local-path-provisioner --timeout=5m
 kubectl get storageclass
 ~~~
 
-성공 기준은 node Ready, CoreDNS/Flannel/local-path-provisioner Running, local-path StorageClass 존재다.
+모든 PVC에 `storageClassName: local-path`를 명시하므로 기본 StorageClass 변경은 필요 없다. `WaitForFirstConsumer` 방식에서는 사용하는 Pod가 생기기 전 PVC Pending이 정상이다. 기본 reclaimPolicy는 Delete이므로 PVC를 지우면 데이터도 삭제될 수 있다. [local-path 공식 매니페스트](https://github.com/rancher/local-path-provisioner/blob/v0.0.36/deploy/local-path-storage.yaml)를 참고한다.
+
+## 4. Harbor 매니페스트 준비
+
+인터넷 연결 준비 환경에서 다음을 실행한다. 폐쇄망이면 생성된 Chart/YAML과 이미지를 반입한다. Harbor 자체 이미지와 클러스터 bootstrap 이미지는 아직 존재하지 않는 Harbor에 의존해서는 안 된다.
+
+~~~bash
+cd "$LAB"
+helm repo add harbor https://helm.goharbor.io
+helm repo update
+helm pull harbor/harbor --version "$HARBOR_CHART_VERSION" --destination charts
+
+cat > manifests/harbor-values.yaml <<EOF
+expose:
+  type: nodePort
+  tls:
+    enabled: true
+    certSource: secret
+    secret:
+      secretName: harbor-tls
+  nodePort:
+    ports:
+      http:
+        nodePort: 30080
+      https:
+        nodePort: $HARBOR_HTTPS_NODEPORT
+externalURL: https://$HARBOR_HOST:$HARBOR_HTTPS_NODEPORT
+persistence:
+  enabled: true
+  persistentVolumeClaim:
+    registry:
+      storageClass: local-path
+    jobservice:
+      storageClass: local-path
+    database:
+      storageClass: local-path
+    redis:
+      storageClass: local-path
+updateStrategy:
+  type: Recreate
+trivy:
+  enabled: false
+existingSecretAdminPassword: harbor-admin
+existingSecretAdminPasswordKey: HARBOR_ADMIN_PASSWORD
+EOF
+
+umask 077
+helm template harbor "charts/harbor-$HARBOR_CHART_VERSION.tgz" \
+  --namespace harbor --values manifests/harbor-values.yaml \
+  > manifests/harbor-rendered.yaml
+~~~
+
+[Harbor Chart 1.18.0 설정](https://github.com/goharbor/harbor-helm/blob/v1.18.0/values.yaml)에 맞춘 예시다. 생성 YAML에는 Secret이 포함되므로 Git에 올리지 않는다. 첫 생성 파일을 안전하게 보존해 재사용한다. 재렌더링하면 자동 생성된 자격 증명이 달라질 수 있다. 이 방식에는 Helm release 이력/rollback/hook 실행이 없으므로 업그레이드는 별도 검토한다. Trivy는 이 실습에서 비활성화한다.
 
 ## 5. Kubernetes에 Harbor 설치
 
 ### 5.1 hostname과 TLS 인증서
 
-모든 cluster node와 Docker 관리 host가 Harbor hostname을 해석해야 한다.
+모든 cluster node와 Docker 관리 host가 Harbor hostname을 해석해야 한다. 아래 `SERVER_IP`는 현재 control-plane의 고정 IP다. NodePort와 kube-proxy가 정상인 이 구성에서는 control-plane IP로 들어온 요청도 worker의 Harbor Pod로 전달된다. 방화벽에서 30443 접근을 허용한다.
 
 ~~~bash
-SERVER_IP=$(hostname -I | awk '{print $1}')
-echo "$SERVER_IP harbor.algo.local" | sudo tee -a /etc/hosts
+
+echo "$SERVER_IP $HARBOR_HOST" | sudo tee -a /etc/hosts
 getent hosts harbor.algo.local
 
-mkdir -p ~/offline-k8s-lab/certs
-cd ~/offline-k8s-lab/certs
+cd "$LAB/certs"
+umask 077
 
 openssl genrsa -out harbor-ca.key 4096
 openssl req -x509 -new -nodes -key harbor-ca.key -sha256 -days 3650 \
@@ -380,25 +346,26 @@ openssl x509 -req -in harbor.csr -CA harbor-ca.crt -CAkey harbor-ca.key \
 
 harbor-ca.key는 CA private key다. 외부에 공유하지 않는다.
 
-### 5.2 Harbor image import와 Helm 설치
+### 5.2 Secret 생성 및 YAML 적용
 
 ~~~bash
-cd ~/offline-k8s-lab
-kubectl create namespace harbor
+cd "$LAB"
+kubectl create namespace harbor --dry-run=client -o yaml | kubectl apply -f -
 kubectl -n harbor create secret tls harbor-tls \
-  --cert=certs/harbor.crt \
-  --key=certs/harbor.key
+  --cert=certs/harbor.crt --key=certs/harbor.key \
+  --dry-run=client -o yaml | kubectl apply -f -
+read -r -s -p 'Harbor 초기 관리자 비밀번호: ' HARBOR_ADMIN_PASSWORD
+printf '\n'
+kubectl -n harbor create secret generic harbor-admin \
+  --from-literal=HARBOR_ADMIN_PASSWORD="$HARBOR_ADMIN_PASSWORD" \
+  --dry-run=client -o yaml | kubectl apply -f -
+unset HARBOR_ADMIN_PASSWORD
 
-sudo ctr -n k8s.io images import images/harbor-images.tar
-
-helm install harbor charts/harbor-$HARBOR_CHART_VERSION.tgz \
-  --namespace harbor \
-  --values manifests/harbor-values.yaml \
-  --wait --timeout 15m
-
-kubectl -n harbor get pods
-kubectl -n harbor get pvc
-kubectl -n harbor get service
+kubectl apply -f manifests/harbor-rendered.yaml
+for resource in $(kubectl -n harbor get deployment,statefulset -o name); do
+  kubectl -n harbor rollout status "$resource" --timeout=15m || break
+done
+kubectl -n harbor get pods,pvc,service
 ~~~
 
 Harbor 첫 시작은 PVC provisioning과 database migration 때문에 시간이 걸릴 수 있다. Pod가 Running이 아니면 다음 순서로 확인한다.
@@ -411,7 +378,7 @@ kubectl -n harbor logs <POD_NAME> --all-containers --tail=100
 
 ### 5.3 Docker와 containerd에 Harbor CA 등록
 
-Docker는 image push에, containerd는 Kubernetes Pod pull에 사용한다. 둘 다 CA를 신뢰해야 한다.
+Docker는 image push에, containerd는 Kubernetes Pod pull에 사용한다. Docker 관리 호스트와 **모든 Kubernetes 노드**에 각각 CA를 등록한다. 앞서 registry.config_path를 설정했다면 certs.d 파일 변경은 containerd 재시작 없이 반영된다. DNS/hosts도 각 호스트에 설정한다. 브라우저를 사용하는 PC에는 CA 인증서를 신뢰 저장소에 등록한다.
 
 ~~~bash
 sudo install -d -m 0755 /etc/docker/certs.d/harbor.algo.local:30443
@@ -430,18 +397,18 @@ server = "https://harbor.algo.local:30443"
   ca = "/etc/containerd/certs.d/harbor.algo.local:30443/ca.crt"
 EOF
 
-sudo systemctl restart containerd
 curl --cacert certs/harbor-ca.crt -I https://harbor.algo.local:30443
 ~~~
 
-브라우저에서 https://harbor.algo.local:30443를 연다. 초기 계정은 admin, 비밀번호는 Harbor12345다. 로그인 뒤 비밀번호를 바꾼다.
+브라우저에서 https://harbor.algo.local:30443를 연다. 초기 계정은 admin, 비밀번호는 앞에서 입력한 값이다. 로그인 뒤 비밀번호를 바꾼다.
 
 UI에서 private project myapp을 만들고, pull 권한만 가진 robot account를 만든다. application Pod의 image pull Secret에는 admin 계정 대신 이 robot account를 사용한다.
 
 ## 6. images.tar를 Harbor에 등록
 
 ~~~bash
-cd ~/offline-k8s-lab
+cd "$LAB"
+# Part 1/2에서 만든 images.tar를 먼저 $LAB/images/images.tar에 복사한다.
 sudo docker load -i images/images.tar
 sudo docker login harbor.algo.local:30443
 
@@ -453,7 +420,7 @@ sudo docker tag postgres:15 \
 sudo docker push harbor.algo.local:30443/myapp/offline-fastapi:1.0.0
 sudo docker push harbor.algo.local:30443/myapp/postgres:15
 
-kubectl create namespace offline-demo
+kubectl create namespace offline-demo --dry-run=client -o yaml | kubectl apply -f -
 kubectl -n offline-demo create secret docker-registry harbor-myapp-pull \
   --docker-server=harbor.algo.local:30443 \
   --docker-username='<ROBOT_NAME>' \
@@ -462,14 +429,15 @@ kubectl -n offline-demo create secret docker-registry harbor-myapp-pull \
 
 Harbor UI의 myapp project에 FastAPI와 PostgreSQL repository가 보이면 성공이다.
 
-## 7. Helm 전: raw Kubernetes YAML 배포
+## 7. Kubernetes 매니페스트(YAML) 애플리케이션 배포
 
-먼저 YAML을 직접 적용해 Deployment, Service, StatefulSet, PVC, Secret의 역할을 확인한다.
+직접 YAML 매니페스트를 작성하여 Deployment, Service, StatefulSet, PVC, Secret 등을 통해 애플리케이션을 배포한다.
 
 ~~~bash
-mkdir -p ~/offline-demo-lab/manifests
-cd ~/offline-demo-lab/manifests
+cd "$LAB/app"
 ~~~
+
+각 YAML 블록을 주석의 파일명으로 저장한다. Secret 파일은 커밋하지 않는다. 예시 비밀번호는 배포 전에 바꾸고 DB와 URL의 값을 일치시킨다.
 
 ~~~yaml
 # database-secret.yaml
@@ -483,6 +451,7 @@ stringData:
   POSTGRES_USER: offlineadmin
   POSTGRES_PASSWORD: OfflinePass12345
   POSTGRES_DB: offline_db
+  DATABASE_URL: postgresql+psycopg://offlineadmin:OfflinePass12345@postgres:5432/offline_db
 ~~~
 
 ~~~yaml
@@ -581,7 +550,10 @@ spec:
               containerPort: 8000
           env:
             - name: DATABASE_URL
-              value: postgresql+psycopg://offlineadmin:OfflinePass12345@postgres:5432/offline_db
+              valueFrom:
+                secretKeyRef:
+                  name: database
+                  key: DATABASE_URL
           readinessProbe:
             httpGet:
               path: /health
@@ -616,279 +588,90 @@ kubectl -n offline-demo rollout status statefulset/postgres --timeout=5m
 kubectl -n offline-demo rollout status deployment/backend --timeout=5m
 kubectl -n offline-demo get all,pvc
 
-SERVER_IP=$(hostname -I | awk '{print $1}')
 curl "http://$SERVER_IP:30800/health"
 curl -X POST "http://$SERVER_IP:30800/items?name=offline-test"
 curl "http://$SERVER_IP:30800/items"
 ~~~
 
-PostgreSQL PVC 영속성을 확인한다.
+PostgreSQL 초기화 변수는 빈 데이터 디렉터리에서만 적용된다. 기존 PVC의 DB 비밀번호는 Secret 수정만으로 바뀌지 않는다.
+
+PostgreSQL PVC 영속성을 확인한다. Pod 삭제는 DB 연결을 잠시 끊으므로 실습에서 실행한다.
 
 ~~~bash
 kubectl -n offline-demo delete pod postgres-0
-kubectl -n offline-demo wait --for=condition=Ready pod/postgres-0 --timeout=5m
+kubectl -n offline-demo rollout status statefulset/postgres --timeout=5m
 curl "http://$SERVER_IP:30800/items"
 ~~~
 
 offline-test가 남아 있으면 PVC가 재사용된 것이다.
 
-## 8. Helm Chart로 전환
-
-Helm은 Kubernetes를 대체하지 않는다. 검증한 YAML을 template과 values로 만들고 release history를 관리한다.
-
-먼저 raw resource를 제거한다. PVC는 별도 삭제하지 않으므로 기존 data-postgres-0은 남을 수 있다. 다만 아래 Helm Chart는 release 이름이 포함된 새 StatefulSet/PVC를 만들므로, 이 실습의 Helm 설치는 새 database로 시작한다. raw YAML의 데이터를 Helm으로 이어야 한다면 release 이름과 PVC 이름을 맞추거나 PostgreSQL dump/restore migration을 별도로 설계한다.
+## 8. 운영 확인과 문제 해결
 
 ~~~bash
-kubectl delete -f ~/offline-demo-lab/manifests/backend.yaml
-kubectl delete -f ~/offline-demo-lab/manifests/postgres.yaml
-kubectl delete -f ~/offline-demo-lab/manifests/database-secret.yaml
-
-mkdir -p ~/offline-demo-lab/helm/offline-demo/templates
-cd ~/offline-demo-lab/helm/offline-demo
+kubectl get nodes -o wide
+kubectl get pods -A -o wide
+kubectl -n offline-demo get pvc
+kubectl -n offline-demo get events --sort-by=.lastTimestamp
+# 실제 Pod 이름으로 치환
+kubectl -n offline-demo describe pod <POD_NAME>
+kubectl -n offline-demo logs <POD_NAME> --all-containers --tail=100
 ~~~
 
-~~~yaml
-# Chart.yaml
-apiVersion: v2
-name: offline-demo
-description: FastAPI and PostgreSQL offline Kubernetes lab
-type: application
-version: 0.1.0
-appVersion: "1.0.0"
-~~~
+| 증상 | 점검할 내용 |
+| --- | --- |
+| kubelet inactive / init 실패 | journalctl, swap, CRI 활성화, systemd cgroup 설정 |
+| localhost:8080 연결 거부 | 현재 사용자 kubeconfig와 context; 패키지 재설치로 해결되지 않음 |
+| worker join 실패 | API 6443 접근, token 만료, CA hash, hostname 중복, runtime |
+| NotReady / CoreDNS Pending | CNI 이미지, Pod CIDR, Flannel UDP 8472, 노드 간 통신 |
+| 모든 업무 Pod Pending | Ready worker 존재 여부, control-plane taint, 자원 부족 |
+| PVC Pending | StorageClass, WaitForFirstConsumer, helper 이미지, 노드 디스크 |
+| ImagePullBackOff | 각 노드 DNS/CA, Harbor 주소, image tag, robot 권한, Secret namespace |
+| Harbor x509 오류 | 인증서 SAN과 접속 이름, containerd registry.config_path, CA 경로 |
+| 앱 DB 접속 오류 | database Secret과 기존 PVC의 실제 DB 계정 일치 여부 |
 
-~~~yaml
-# values.yaml
-harborPullSecret: harbor-myapp-pull
-backend:
-  image:
-    repository: harbor.algo.local:30443/myapp/offline-fastapi
-    tag: "1.0.0"
-  nodePort: 30800
-postgres:
-  image:
-    repository: harbor.algo.local:30443/myapp/postgres
-    tag: "15"
-  storageClass: local-path
-  storage: 5Gi
-~~~
+배포 성공 기준은 모든 노드 Ready, CNI/CoreDNS 정상, Harbor Pod 준비 및 PVC Bound, 앱 rollout 완료, `/health` 응답과 item 생성/조회 성공이다. Pod 재생성 후 item이 유지되는지도 확인한다.
 
-~~~yaml
-# values-lab.yaml - password를 Git에 commit하지 않는다.
-database:
-  user: offlineadmin
-  password: OfflinePass12345
-  name: offline_db
-~~~
+현재 구성은 control-plane 하나이므로 그 서버가 중단되면 클러스터 관리가 중단된다. local-path 데이터는 해당 worker에 귀속되므로 다른 PC로 Pod를 옮겨도 데이터가 자동 복제되지 않는다. 운영 전 etcd/DB/Harbor 데이터 백업과 복원, 인증서 갱신, 자원 제한, 접근 제어를 준비한다. 기본 Flannel 구성만으로 NetworkPolicy를 집행할 수 있다고 가정하지 않는다.
 
-~~~gotemplate
-{{/* templates/_helpers.tpl */}}
-{{- define "offline-demo.fullname" -}}
-{{- printf "%s-offline-demo" .Release.Name | trunc 63 | trimSuffix "-" }}
-{{- end }}
-~~~
+## 부록 A. 인터넷이 차단된 경우에만: 이미지/매니페스트 반입
 
-~~~yaml
-# templates/secrets.yaml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: {{ include "offline-demo.fullname" . }}-database
-type: Opaque
-stringData:
-  POSTGRES_USER: {{ required "database.user is required" .Values.database.user | quote }}
-  POSTGRES_PASSWORD: {{ required "database.password is required" .Values.database.password | quote }}
-  POSTGRES_DB: {{ required "database.name is required" .Values.database.name | quote }}
-~~~
-
-다음 두 template을 그대로 만든다. Secret 값은 values-lab.yaml에서만 제공한다.
-
-~~~yaml
-# templates/postgres.yaml
-apiVersion: v1
-kind: Service
-metadata:
-  name: {{ include "offline-demo.fullname" . }}-postgres
-spec:
-  clusterIP: None
-  selector:
-    app: {{ include "offline-demo.fullname" . }}-postgres
-  ports:
-    - name: postgres
-      port: 5432
-      targetPort: postgres
----
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: {{ include "offline-demo.fullname" . }}-postgres
-spec:
-  serviceName: {{ include "offline-demo.fullname" . }}-postgres
-  replicas: 1
-  selector:
-    matchLabels:
-      app: {{ include "offline-demo.fullname" . }}-postgres
-  template:
-    metadata:
-      labels:
-        app: {{ include "offline-demo.fullname" . }}-postgres
-    spec:
-      imagePullSecrets:
-        - name: {{ .Values.harborPullSecret }}
-      containers:
-        - name: postgres
-          image: "{{ .Values.postgres.image.repository }}:{{ .Values.postgres.image.tag }}"
-          envFrom:
-            - secretRef:
-                name: {{ include "offline-demo.fullname" . }}-database
-          readinessProbe:
-            exec:
-              command: ["sh", "-c", "pg_isready -U $POSTGRES_USER -d $POSTGRES_DB"]
-            initialDelaySeconds: 5
-            periodSeconds: 5
-          volumeMounts:
-            - name: data
-              mountPath: /var/lib/postgresql/data
-  volumeClaimTemplates:
-    - metadata:
-        name: data
-      spec:
-        accessModes: ["ReadWriteOnce"]
-        storageClassName: {{ .Values.postgres.storageClass }}
-        resources:
-          requests:
-            storage: {{ .Values.postgres.storage }}
-~~~
-
-~~~yaml
-# templates/backend.yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: {{ include "offline-demo.fullname" . }}-backend
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: {{ include "offline-demo.fullname" . }}-backend
-  template:
-    metadata:
-      labels:
-        app: {{ include "offline-demo.fullname" . }}-backend
-    spec:
-      imagePullSecrets:
-        - name: {{ .Values.harborPullSecret }}
-      initContainers:
-        - name: wait-for-postgres
-          image: "{{ .Values.postgres.image.repository }}:{{ .Values.postgres.image.tag }}"
-          command: ['sh', '-c', 'until pg_isready -h {{ include "offline-demo.fullname" . }}-postgres -U $POSTGRES_USER -d $POSTGRES_DB; do sleep 2; done']
-          envFrom:
-            - secretRef:
-                name: {{ include "offline-demo.fullname" . }}-database
-      containers:
-        - name: backend
-          image: "{{ .Values.backend.image.repository }}:{{ .Values.backend.image.tag }}"
-          ports:
-            - name: http
-              containerPort: 8000
-          env:
-            - name: DATABASE_URL
-              value: 'postgresql+psycopg://{{ .Values.database.user }}:{{ .Values.database.password }}@{{ include "offline-demo.fullname" . }}-postgres:5432/{{ .Values.database.name }}'
-          readinessProbe:
-            httpGet:
-              path: /health
-              port: http
-            initialDelaySeconds: 3
-            periodSeconds: 5
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: {{ include "offline-demo.fullname" . }}-backend
-spec:
-  type: NodePort
-  selector:
-    app: {{ include "offline-demo.fullname" . }}-backend
-  ports:
-    - name: http
-      port: 8000
-      targetPort: http
-      nodePort: {{ .Values.backend.nodePort }}
-~~~
-
-먼저 lint와 render를 수행한다.
+본문 3절 전에 준비한다. 준비 서버는 대상과 동일한 CPU 아키텍처를 사용하고 같은 kubeadm 버전 및 본문의 변수를 설정한다. 본문 3.2/3.4의 파일 다운로드와 helper 태그 고정, 4절의 Chart 렌더링을 **준비 서버에서** 먼저 실행하되 `kubectl apply`는 대상 클러스터에서 수행한다. 다운로드 명령과 적용 명령은 나눠 실행한다.
 
 ~~~bash
-helm lint . --values values-lab.yaml
-helm template offline-demo . --namespace offline-demo --values values-lab.yaml > rendered.yaml
-kubectl apply --dry-run=client -f rendered.yaml
-
-helm install offline-demo . \
-  --namespace offline-demo \
-  --create-namespace \
-  --values values-lab.yaml \
-  --wait --timeout 5m
-
-helm list -n offline-demo
-kubectl -n offline-demo get all,pvc
+cd "$LAB"
+kubeadm config images list --kubernetes-version "$KUBERNETES_VERSION" > images/kubeadm-images.txt
+# .yml, .yaml 모두 포함. local-path ConfigMap 안의 helper 이미지도 포함된다.
+awk '/^[[:space:]]*image:/{gsub(/"/, "", $2); print $2}' \
+  manifests/kube-flannel.yml manifests/local-path-storage.yaml manifests/harbor-rendered.yaml \
+  > images/addon-harbor-images.txt
+cat images/kubeadm-images.txt images/addon-harbor-images.txt | sort -u > images/all-images.txt
+while IFS= read -r image; do
+  sudo docker pull "$image" || exit 1
+done < images/all-images.txt
+mapfile -t IMAGES < images/all-images.txt
+sudo docker save -o images/bootstrap.tar "${IMAGES[@]}"
+sha256sum images/bootstrap.tar > images/bootstrap.tar.sha256
 ~~~
 
-upgrade와 rollback을 확인하려고 같은 FastAPI image에 실습용 tag를 push한다.
+containerd의 sandbox(pause) 이미지 참조도 확인한다. `kubeadm config images list`의 pause와 runtime의 sandbox_image가 다르면 버전을 일치시키거나 runtime이 요구하는 이미지도 추가로 반입한다. CNI 실행 바이너리(`/opt/cni/bin`)와 CRI runtime은 이미지 tar와 별개이며 각 worker에 설치되어 있어야 한다.
+
+`$LAB`의 manifests/charts/images와 checksum을 대상에 복사한다. 준비 단계에서 생성한 Secret 포함 YAML은 안전하게 전달한다. 대상에서는 다음을 **모든 노드에서** 실행한 뒤 본문의 로컬 파일 apply 절차를 진행한다.
 
 ~~~bash
-sudo docker tag harbor.algo.local:30443/myapp/offline-fastapi:1.0.0 \
-  harbor.algo.local:30443/myapp/offline-fastapi:1.0.1
-sudo docker push harbor.algo.local:30443/myapp/offline-fastapi:1.0.1
-
-helm upgrade offline-demo . \
-  --namespace offline-demo \
-  --values values-lab.yaml \
-  --set backend.image.tag=1.0.1 \
-  --wait --rollback-on-failure --timeout 5m
-
-helm history offline-demo -n offline-demo
-helm rollback offline-demo 1 --namespace offline-demo --wait --timeout 5m
-helm history offline-demo -n offline-demo
+cd "$LAB"
+sha256sum -c images/bootstrap.tar.sha256
+sudo ctr -n k8s.io images import images/bootstrap.tar
+sudo ctr -n k8s.io images list
 ~~~
 
-history에는 install revision 1, upgrade revision 2, rollback revision 3이 보인다. Harbor 자체 upgrade는 database migration을 수반할 수 있으므로 application release처럼 무조건 rollback하면 안 된다.
+Docker load는 Kubernetes의 containerd 이미지 저장소를 채우지 않는다. `ctr -n k8s.io`로 가져와야 한다. 이미지가 들어온 뒤에는 `kubeadm config images pull` 및 외부 curl/helm repo 명령을 생략한다. 추가 PC도 join **전에** bootstrap/CNI 이미지를 반입한다. Harbor 장애 시 자체 이미지를 다시 받을 수 있도록 이 파일을 보관한다.
 
-## 9. 문제 해결
+현재 서버의 세 패키지는 이미 설치되어 있다. 신규 폐쇄망 worker에는 동일 OS/아키텍처용 kubelet/kubeadm 및 containerd, CNI 바이너리, cri-tools와 모든 의존 패키지를 따로 반입해야 한다. 패키지 다운로드 캐시는 준비 서버에 이미 설치된 의존성을 누락할 수 있으므로 네트워크를 끈 동일 OS VM에서 설치를 검증한다. kubectl은 관리 PC/control-plane에 필요하며 worker 관리에는 필수가 아니다.
 
-| 증상 | 먼저 실행할 명령 | 흔한 원인 |
-| --- | --- | --- |
-| kubeadm init swap 오류 | swapon --show | swap 비활성화 실패 |
-| node NotReady / CoreDNS Pending | kubectl -n kube-system get pods | Flannel 미설치 또는 image 없음 |
-| Flannel CrashLoop | kubectl -n kube-flannel logs POD | Pod CIDR, kernel module, sysctl 오류 |
-| PVC Pending | kubectl describe pvc NAME | local-path-provisioner/StorageClass 문제 |
-| x509 unknown authority | containerd certs.d 확인 | CA 경로, hostname, restart 누락 |
-| ImagePullBackOff | kubectl describe pod POD | image tag, robot 권한, pull Secret |
-| Harbor Pod Pending | kubectl -n harbor get pvc | local-path provisioning 실패 |
-| Helm render 오류 | helm lint, helm template | template 들여쓰기 또는 value 누락 |
+## 참고 문서
 
-진단은 host → cluster → storage → registry → application → release 순서로 한다.
-
-## 10. 완료 체크리스트
-
-- [ ] 기존 k3s resource와 PVC 상태를 기록하고 제거했다.
-- [ ] 대상 서버에서 외부 APT, Docker Hub, Helm repository에 접근하지 않았다.
-- [ ] 반입 artifact checksum을 검증했다.
-- [ ] kubeadm node, CoreDNS, Flannel, local-path-provisioner가 Ready다.
-- [ ] Harbor가 https://harbor.algo.local:30443에서 TLS로 열린다.
-- [ ] Docker와 containerd가 Harbor CA를 신뢰한다.
-- [ ] myapp private project에 두 application image가 있다.
-- [ ] raw YAML로 health, item 생성, item 조회가 된다.
-- [ ] PostgreSQL Pod 재생성 뒤에도 item이 남는다.
-- [ ] Helm lint/template/install/upgrade/rollback을 수행했다.
-
-## 공식 문서
-
-- [k3s Uninstall](https://docs.k3s.io/installation/uninstall)
-- [Installing kubeadm](https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/install-kubeadm/)
-- [Creating a cluster with kubeadm](https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/create-cluster-kubeadm/)
-- [Container runtimes](https://kubernetes.io/docs/setup/production-environment/container-runtimes/)
+- [kubeadm 설치하기](https://kubernetes.io/ko/docs/setup/production-environment/tools/kubeadm/install-kubeadm/)
+- [kubeadm으로 클러스터 생성하기](https://kubernetes.io/ko/docs/setup/production-environment/tools/kubeadm/create-cluster-kubeadm/)
+- [컨테이너 런타임과 cgroup 설정](https://kubernetes.io/docs/setup/production-environment/container-runtimes/)
 - [Flannel](https://github.com/flannel-io/flannel)
-- [local-path-provisioner](https://github.com/rancher/local-path-provisioner)
-- [Harbor Helm deployment](https://goharbor.io/docs/main/install-config/harbor-ha-helm/)
-- [Harbor Chart values](https://github.com/goharbor/harbor-helm/blob/main/values.yaml)
-- [Helm commands](https://helm.sh/docs/helm/)
+- [Harbor Chart](https://github.com/goharbor/harbor-helm)
