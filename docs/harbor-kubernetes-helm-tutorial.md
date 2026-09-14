@@ -1,10 +1,19 @@
-# kubeadm 클러스터 구성 → Harbor → 매니페스트 기반 온프레미스 배포
+# kubeadm + MetalLB 로드밸런서 → Harbor → 매니페스트 기반 온프레미스 배포
 
 [공식 kubeadm 설치 가이드](https://kubernetes.io/ko/docs/setup/production-environment/tools/kubeadm/install-kubeadm/)로 **kubelet, kubeadm, kubectl을 설치한 다음 단계**부터 진행한다. [공식 클러스터 구성 가이드](https://kubernetes.io/ko/docs/setup/production-environment/tools/kubeadm/create-cluster-kubeadm/)의 순서에 맞춰 클러스터를 만들고, Harbor에 이미지를 등록한 뒤 FastAPI/PostgreSQL을 YAML로 배포한다.
 
 온프레미스는 자체 서버에 배포한다는 뜻이며 반드시 폐쇄망을 뜻하지 않는다. 본문은 설치 시 외부 저장소에 접근할 수 있는 서버를 기준으로 한다. 외부 접속이 차단된 경우에는 **부록 A의 사전 반입을 먼저 수행**하고 본문의 다운로드 대신 반입 파일을 사용한다. 이미 설치한 Kubernetes 패키지를 다시 다운로드하거나 k3s를 삭제하는 절차는 필수가 아니다.
 
 Harbor는 공식 Chart를 `helm template`으로 YAML로 변환한 뒤 `kubectl apply`로 설치한다. Helm은 매니페스트 생성에만 사용하며, 애플리케이션은 직접 작성한 Deployment/StatefulSet/Service/Secret 매니페스트로 관리한다. 파일명은 기존 링크 호환성을 위해 유지한다.
+
+이 문서의 로드밸런서는 **Harbor와 애플리케이션의 사내 접속용**이다. MetalLB L2로 서비스 전용 IP를 할당/광고하고 Kubernetes Service가 Ready Pod로 트래픽을 전달한다. Kubernetes API는 `192.168.0.99:6443`을 사용한다. Ingress 없이 Harbor와 앱에 각각 LoadBalancer Service를 구성한다.
+
+~~~text
+관리 PC / worker ── 192.168.0.99:6443 ── control-plane (ssh99)
+사내 클라이언트 ── Harbor VIP:443 ── Harbor Service ── Harbor Pod ┐
+사내 클라이언트 ── 앱 VIP:80 ────── backend Service ── FastAPI Pod ├─ worker (ssh98)
+                                                            PostgreSQL ┘
+~~~
 
 ## 1. 설치 상태 확인
 
@@ -81,7 +90,9 @@ sudo apt-mark hold kubeadm kubelet kubectl
 | kubelet TCP 10250 | control-plane → 노드 |
 | controller/scheduler TCP 10257/10259 | control-plane 내부 |
 | Flannel VXLAN UDP 8472 | 노드 사이, 외부 공개 금지 |
-| Harbor TCP 30443 / 앱 TCP 30800 | 허용된 사내 클라이언트 → 노드 |
+| Harbor VIP TCP 443 / 앱 VIP TCP 80 | 허용된 사내 클라이언트 → 서비스 VIP |
+| MetalLB TCP/UDP 7946 | speaker가 실행되는 노드 사이 |
+| MetalLB webhook TCP 9443 | API server → MetalLB controller Pod |
 
 Pod CIDR `10.244.0.0/16`, Service CIDR `10.96.0.0/12`가 사내 LAN/VPN과 겹치지 않는지 확인한다. 겹치면 init 설정과 Flannel의 Network를 함께 변경한다. 방화벽 전체를 끄지 않고 필요한 통신만 허용한다.
 
@@ -100,7 +111,10 @@ export FLANNEL_VERSION='v0.27.4'
 export LOCAL_PATH_VERSION='v0.0.36'
 export HARBOR_CHART_VERSION='1.18.0'
 export HARBOR_HOST='harbor.algo.local'
-export HARBOR_HTTPS_NODEPORT='30443'
+export METALLB_VERSION='v0.16.1'
+# 아래 두 주소는 예시다. DHCP 제외 및 미사용 확인 후 예약한 주소로 바꾼다.
+export HARBOR_LB_IP='192.168.0.240'
+export APP_LB_IP='192.168.0.241'
 cd "$LAB"
 ~~~
 
@@ -254,6 +268,63 @@ kubectl get storageclass
 
 모든 PVC에 `storageClassName: local-path`를 명시하므로 기본 StorageClass 변경은 필요 없다. `WaitForFirstConsumer` 방식에서는 사용하는 Pod가 생기기 전 PVC Pending이 정상이다. 기본 reclaimPolicy는 Delete이므로 PVC를 지우면 데이터도 삭제될 수 있다. [local-path 공식 매니페스트](https://github.com/rancher/local-path-provisioner/blob/v0.0.36/deploy/local-path-storage.yaml)를 참고한다.
 
+### 3.5 MetalLB로 LoadBalancer IP 제공
+
+**IP 계획:** `192.168.0.240`(Harbor), `192.168.0.241`(앱)은 문서용 예시이며 실제 사용 가능 여부는 확인하지 않았다. 네트워크 관리자/공유기에서 두 주소를 DHCP 할당 범위에서 제외하고 예약한 뒤 사용한다. 노드 IP `.99`, `.98`을 VIP로 재사용하지 않는다. 예시 IP를 변경하면 아래 변수와 7절 backend.yaml의 annotation도 함께 변경한다.
+
+L2 모드는 worker의 LAN 인터페이스와 VIP가 같은 L2 네트워크에 있고 ARP 광고가 허용되어야 한다. 주소가 비어 있는지는 ping 무응답만으로 판단하지 않는다. VM을 사용하면 브리지 네트워크와 가상 스위치의 ARP/MAC 정책도 확인한다. 노드 NIC에 VIP를 수동 추가하지 않는다.
+
+~~~bash
+# 192.168.0.99에서 실행. worker가 Ready인 상태여야 한다.
+cd "$LAB"
+curl -fL -o manifests/metallb-native.yaml \
+  "https://raw.githubusercontent.com/metallb/metallb/$METALLB_VERSION/config/manifests/metallb-native.yaml"
+kubectl apply -f manifests/metallb-native.yaml
+kubectl -n metallb-system rollout status deployment/controller --timeout=5m
+kubectl -n metallb-system rollout status daemonset/speaker --timeout=5m
+kubectl -n metallb-system get pods -o wide
+kubectl -n metallb-system get endpointslice \
+  -l kubernetes.io/service-name=metallb-webhook-service
+~~~
+
+EndpointSlice에 controller 주소가 있고 controller가 Ready인지 확인한다. kube-proxy가 IPVS 모드라면 MetalLB 적용 전 ConfigMap의 `ipvs.strictARP: true`를 설정하고 kube-proxy DaemonSet을 재시작한다. iptables/nftables 모드에는 이 IPVS 설정이 필요 없다. [공식 설치 절차](https://metallb.io/installation/)를 참고한다.
+
+~~~bash
+kubectl -n kube-system get configmap kube-proxy -o jsonpath='{.data.config\.conf}'
+# IPVS인 경우에만 실행
+# kubectl -n kube-system edit configmap kube-proxy
+# kubectl -n kube-system rollout restart daemonset/kube-proxy
+# kubectl -n kube-system rollout status daemonset/kube-proxy --timeout=5m
+
+cat > manifests/metallb-pool.yaml <<EOF
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: onprem-pool
+  namespace: metallb-system
+spec:
+  autoAssign: false
+  addresses:
+    - $HARBOR_LB_IP/32
+    - $APP_LB_IP/32
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: onprem-l2
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+    - onprem-pool
+EOF
+kubectl apply -f manifests/metallb-pool.yaml
+kubectl -n metallb-system get ipaddresspools,l2advertisements
+~~~
+
+`autoAssign: false`로 두 IP를 명시적으로 요청한 Service에 할당한다. [MetalLB 설정](https://metallb.io/configuration/)의 IPAddressPool/L2Advertisement를 사용한다. control-plane의 `node.kubernetes.io/exclude-from-external-load-balancers` 라벨은 유지한다. worker의 speaker가 VIP를 광고하는 구성이며, worker가 하나이므로 worker 장애 시 Harbor/앱과 VIP 접속이 중단된다.
+
+L2에서는 한 노드가 VIP로 들어오는 트래픽을 받고 Service가 Pod들로 분산한다. 앱 replica를 늘리면 Pod 단위 분산이 가능하지만, 현재 worker 한 대에서는 서버 장애를 견디지 못한다. 서버 간 분산/장애 대응에는 추가 worker와 데이터 계층의 가용성 설계가 필요하다. [L2 동작과 한계](https://metallb.io/concepts/layer2/)
+
 ## 4. Harbor 매니페스트 준비
 
 인터넷 연결 준비 환경에서 다음을 실행한다. 폐쇄망이면 생성된 Chart/YAML과 이미지를 반입한다. Harbor 자체 이미지와 클러스터 bootstrap 이미지는 아직 존재하지 않는 Harbor에 의존해서는 안 된다.
@@ -266,26 +337,29 @@ helm pull harbor/harbor --version "$HARBOR_CHART_VERSION" --destination charts
 
 cat > manifests/harbor-values.yaml <<EOF
 expose:
-  type: nodePort
+  type: loadBalancer
   tls:
     enabled: true
     certSource: secret
     secret:
       secretName: harbor-tls
-  nodePort:
+  loadBalancer:
+    name: harbor
     ports:
-      http:
-        nodePort: 30080
-      https:
-        nodePort: $HARBOR_HTTPS_NODEPORT
-externalURL: https://$HARBOR_HOST:$HARBOR_HTTPS_NODEPORT
+      httpPort: 80
+      httpsPort: 443
+    annotations:
+      metallb.io/address-pool: onprem-pool
+      metallb.io/loadBalancerIPs: "$HARBOR_LB_IP"
+externalURL: https://$HARBOR_HOST
 persistence:
   enabled: true
   persistentVolumeClaim:
     registry:
       storageClass: local-path
     jobservice:
-      storageClass: local-path
+      jobLog:
+        storageClass: local-path
     database:
       storageClass: local-path
     redis:
@@ -310,11 +384,11 @@ helm template harbor "charts/harbor-$HARBOR_CHART_VERSION.tgz" \
 
 ### 5.1 hostname과 TLS 인증서
 
-모든 cluster node와 Docker 관리 host가 Harbor hostname을 해석해야 한다. 아래 `SERVER_IP`는 현재 control-plane의 고정 IP다. NodePort와 kube-proxy가 정상인 이 구성에서는 control-plane IP로 들어온 요청도 worker의 Harbor Pod로 전달된다. 방화벽에서 30443 접근을 허용한다.
+모든 cluster node와 Docker 관리 host, 브라우저 PC에서 Harbor hostname을 **Harbor VIP**로 해석해야 한다. 사내 DNS에 A 레코드를 등록하거나 각 호스트의 `/etc/hosts`를 수정한다. 기존 `.99` 매핑은 제거/수정해 한 주소만 반환되게 한다. 방화벽에서 VIP의 TCP 443 접근을 허용한다.
 
 ~~~bash
 
-echo "$SERVER_IP $HARBOR_HOST" | sudo tee -a /etc/hosts
+echo "$HARBOR_LB_IP $HARBOR_HOST" | sudo tee -a /etc/hosts
 getent hosts harbor.algo.local
 
 cd "$LAB/certs"
@@ -366,7 +440,10 @@ for resource in $(kubectl -n harbor get deployment,statefulset -o name); do
   kubectl -n harbor rollout status "$resource" --timeout=15m || break
 done
 kubectl -n harbor get pods,pvc,service
+kubectl -n harbor get service harbor -o wide
 ~~~
+
+`harbor` Service의 EXTERNAL-IP가 예약한 Harbor VIP인지 확인한다. Pending이면 8절의 MetalLB 진단을 먼저 수행한다.
 
 Harbor 첫 시작은 PVC provisioning과 database migration 때문에 시간이 걸릴 수 있다. Pod가 Running이 아니면 다음 순서로 확인한다.
 
@@ -381,26 +458,26 @@ kubectl -n harbor logs <POD_NAME> --all-containers --tail=100
 Docker는 image push에, containerd는 Kubernetes Pod pull에 사용한다. Docker 관리 호스트와 **모든 Kubernetes 노드**에 각각 CA를 등록한다. 앞서 registry.config_path를 설정했다면 certs.d 파일 변경은 containerd 재시작 없이 반영된다. DNS/hosts도 각 호스트에 설정한다. 브라우저를 사용하는 PC에는 CA 인증서를 신뢰 저장소에 등록한다.
 
 ~~~bash
-sudo install -d -m 0755 /etc/docker/certs.d/harbor.algo.local:30443
+sudo install -d -m 0755 /etc/docker/certs.d/harbor.algo.local
 sudo install -m 0644 certs/harbor-ca.crt \
-  /etc/docker/certs.d/harbor.algo.local:30443/ca.crt
+  /etc/docker/certs.d/harbor.algo.local/ca.crt
 
-sudo install -d -m 0755 /etc/containerd/certs.d/harbor.algo.local:30443
+sudo install -d -m 0755 /etc/containerd/certs.d/harbor.algo.local
 sudo install -m 0644 certs/harbor-ca.crt \
-  /etc/containerd/certs.d/harbor.algo.local:30443/ca.crt
+  /etc/containerd/certs.d/harbor.algo.local/ca.crt
 
-cat <<'EOF' | sudo tee /etc/containerd/certs.d/harbor.algo.local:30443/hosts.toml
-server = "https://harbor.algo.local:30443"
+cat <<'EOF' | sudo tee /etc/containerd/certs.d/harbor.algo.local/hosts.toml
+server = "https://harbor.algo.local"
 
-[host."https://harbor.algo.local:30443"]
+[host."https://harbor.algo.local"]
   capabilities = ["pull", "resolve", "push"]
-  ca = "/etc/containerd/certs.d/harbor.algo.local:30443/ca.crt"
+  ca = "/etc/containerd/certs.d/harbor.algo.local/ca.crt"
 EOF
 
-curl --cacert certs/harbor-ca.crt -I https://harbor.algo.local:30443
+curl --cacert certs/harbor-ca.crt -I https://harbor.algo.local
 ~~~
 
-브라우저에서 https://harbor.algo.local:30443를 연다. 초기 계정은 admin, 비밀번호는 앞에서 입력한 값이다. 로그인 뒤 비밀번호를 바꾼다.
+브라우저에서 https://harbor.algo.local를 연다. 초기 계정은 admin, 비밀번호는 앞에서 입력한 값이다. 로그인 뒤 비밀번호를 바꾼다.
 
 UI에서 private project myapp을 만들고, pull 권한만 가진 robot account를 만든다. application Pod의 image pull Secret에는 admin 계정 대신 이 robot account를 사용한다.
 
@@ -410,19 +487,19 @@ UI에서 private project myapp을 만들고, pull 권한만 가진 robot account
 cd "$LAB"
 # Part 1/2에서 만든 images.tar를 먼저 $LAB/images/images.tar에 복사한다.
 sudo docker load -i images/images.tar
-sudo docker login harbor.algo.local:30443
+sudo docker login harbor.algo.local
 
 sudo docker tag offline-fastapi:1.0.0 \
-  harbor.algo.local:30443/myapp/offline-fastapi:1.0.0
+  harbor.algo.local/myapp/offline-fastapi:1.0.0
 sudo docker tag postgres:15 \
-  harbor.algo.local:30443/myapp/postgres:15
+  harbor.algo.local/myapp/postgres:15
 
-sudo docker push harbor.algo.local:30443/myapp/offline-fastapi:1.0.0
-sudo docker push harbor.algo.local:30443/myapp/postgres:15
+sudo docker push harbor.algo.local/myapp/offline-fastapi:1.0.0
+sudo docker push harbor.algo.local/myapp/postgres:15
 
 kubectl create namespace offline-demo --dry-run=client -o yaml | kubectl apply -f -
 kubectl -n offline-demo create secret docker-registry harbor-myapp-pull \
-  --docker-server=harbor.algo.local:30443 \
+  --docker-server=harbor.algo.local \
   --docker-username='<ROBOT_NAME>' \
   --docker-password='<ROBOT_TOKEN>'
 ~~~
@@ -490,7 +567,7 @@ spec:
         - name: harbor-myapp-pull
       containers:
         - name: postgres
-          image: harbor.algo.local:30443/myapp/postgres:15
+          image: harbor.algo.local/myapp/postgres:15
           ports:
             - name: postgres
               containerPort: 5432
@@ -537,14 +614,14 @@ spec:
         - name: harbor-myapp-pull
       initContainers:
         - name: wait-for-postgres
-          image: harbor.algo.local:30443/myapp/postgres:15
+          image: harbor.algo.local/myapp/postgres:15
           command: ["sh", "-c", "until pg_isready -h postgres -U $POSTGRES_USER -d $POSTGRES_DB; do sleep 2; done"]
           envFrom:
             - secretRef:
                 name: database
       containers:
         - name: backend
-          image: harbor.algo.local:30443/myapp/offline-fastapi:1.0.0
+          image: harbor.algo.local/myapp/offline-fastapi:1.0.0
           ports:
             - name: http
               containerPort: 8000
@@ -566,15 +643,18 @@ kind: Service
 metadata:
   name: backend
   namespace: offline-demo
+  annotations:
+    metallb.io/address-pool: onprem-pool
+    metallb.io/loadBalancerIPs: "192.168.0.241"  # 예약한 APP_LB_IP로 변경
 spec:
-  type: NodePort
+  type: LoadBalancer
+  externalTrafficPolicy: Cluster
   selector:
     app: backend
   ports:
     - name: http
-      port: 8000
+      port: 80
       targetPort: http
-      nodePort: 30800
 ~~~
 
 실습 비밀번호는 URL escape 문제가 없는 영숫자 값이다. 실제 비밀번호에 @, :, / 등이 있으면 DATABASE_URL에 URI encoding이 필요하다.
@@ -587,10 +667,11 @@ kubectl apply -f backend.yaml
 kubectl -n offline-demo rollout status statefulset/postgres --timeout=5m
 kubectl -n offline-demo rollout status deployment/backend --timeout=5m
 kubectl -n offline-demo get all,pvc
+kubectl -n offline-demo get service backend -o wide
 
-curl "http://$SERVER_IP:30800/health"
-curl -X POST "http://$SERVER_IP:30800/items?name=offline-test"
-curl "http://$SERVER_IP:30800/items"
+curl "http://$APP_LB_IP/health"
+curl -X POST "http://$APP_LB_IP/items?name=offline-test"
+curl "http://$APP_LB_IP/items"
 ~~~
 
 PostgreSQL 초기화 변수는 빈 데이터 디렉터리에서만 적용된다. 기존 PVC의 DB 비밀번호는 Secret 수정만으로 바뀌지 않는다.
@@ -600,10 +681,12 @@ PostgreSQL PVC 영속성을 확인한다. Pod 삭제는 DB 연결을 잠시 끊�
 ~~~bash
 kubectl -n offline-demo delete pod postgres-0
 kubectl -n offline-demo rollout status statefulset/postgres --timeout=5m
-curl "http://$SERVER_IP:30800/items"
+curl "http://$APP_LB_IP/items"
 ~~~
 
 offline-test가 남아 있으면 PVC가 재사용된 것이다.
+
+앱 Service의 EXTERNAL-IP가 APP_LB_IP인지 확인한다. 현재 앱의 HTTP 80은 사내 실습용이며 운영의 HTTPS/호스트 기반 라우팅은 별도의 Ingress/Gateway 구성을 추가한다. LoadBalancer Service는 기본적으로 내부 NodePort도 할당할 수 있지만 사용자는 VIP와 서비스 포트로 접속한다.
 
 ## 8. 운영 확인과 문제 해결
 
@@ -621,6 +704,9 @@ kubectl -n offline-demo logs <POD_NAME> --all-containers --tail=100
 | --- | --- |
 | kubelet inactive / init 실패 | journalctl, swap, CRI 활성화, systemd cgroup 설정 |
 | localhost:8080 연결 거부 | 현재 사용자 kubeconfig와 context; 패키지 재설치로 해결되지 않음 |
+| EXTERNAL-IP Pending | MetalLB controller, pool 범위, autoAssign와 Service annotation, IP 중복 할당 |
+| VIP 접속 불가 | speaker 로그, worker Ready, ARP/L2 연결, 7946 방화벽, Service EndpointSlice |
+| MetalLB webhook 오류 | controller Ready/EndpointSlice, API → controller 9443 통신; webhook 검증을 끄지 말고 원인 해결 |
 | worker join 실패 | API 6443 접근, token 만료, CA hash, hostname 중복, runtime |
 | NotReady / CoreDNS Pending | CNI 이미지, Pod CIDR, Flannel UDP 8472, 노드 간 통신 |
 | 모든 업무 Pod Pending | Ready worker 존재 여부, control-plane taint, 자원 부족 |
@@ -631,18 +717,28 @@ kubectl -n offline-demo logs <POD_NAME> --all-containers --tail=100
 
 배포 성공 기준은 모든 노드 Ready, CNI/CoreDNS 정상, Harbor Pod 준비 및 PVC Bound, 앱 rollout 완료, `/health` 응답과 item 생성/조회 성공이다. Pod 재생성 후 item이 유지되는지도 확인한다.
 
+~~~bash
+kubectl -n metallb-system logs deployment/controller --tail=100
+kubectl -n metallb-system logs -l component=speaker -c speaker --tail=100
+kubectl -n harbor describe service harbor
+kubectl -n offline-demo describe service backend
+kubectl -n offline-demo get endpointslice -l kubernetes.io/service-name=backend
+~~~
+
+**API용 로드밸런서와 구분:** 이 문서의 MetalLB는 클러스터가 시작된 뒤 Service를 노출한다. kubeadm bootstrap용 API 로드밸런서로 사용하지 않는다. API까지 LB 기반으로 구성하려면 클러스터 외부에서 실행되는 TCP 로드밸런서(예: HAProxy 또는 기존 장비)와 API 전용 VIP/DNS를 먼저 준비하고 첫 init의 `--control-plane-endpoint` 및 join 대상에 사용한다. backend는 현재 `192.168.0.99:6443` 한 대이며, worker `.98`을 API backend에 넣지 않는다. API 고가용성에는 보통 3대 이상의 control-plane과 LB 자체의 이중화가 필요하다. [kubeadm HA 가이드](https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/high-availability/)
+
 현재 구성은 control-plane 하나이므로 그 서버가 중단되면 클러스터 관리가 중단된다. local-path 데이터는 해당 worker에 귀속되므로 다른 PC로 Pod를 옮겨도 데이터가 자동 복제되지 않는다. 운영 전 etcd/DB/Harbor 데이터 백업과 복원, 인증서 갱신, 자원 제한, 접근 제어를 준비한다. 기본 Flannel 구성만으로 NetworkPolicy를 집행할 수 있다고 가정하지 않는다.
 
 ## 부록 A. 인터넷이 차단된 경우에만: 이미지/매니페스트 반입
 
-본문 3절 전에 준비한다. 준비 서버는 대상과 동일한 CPU 아키텍처를 사용하고 같은 kubeadm 버전 및 본문의 변수를 설정한다. 본문 3.2/3.4의 파일 다운로드와 helper 태그 고정, 4절의 Chart 렌더링을 **준비 서버에서** 먼저 실행하되 `kubectl apply`는 대상 클러스터에서 수행한다. 다운로드 명령과 적용 명령은 나눠 실행한다.
+본문 3절 전에 준비한다. 준비 서버는 대상과 동일한 CPU 아키텍처를 사용하고 같은 kubeadm 버전 및 본문의 변수를 설정한다. 본문 3.2/3.4/3.5의 파일 다운로드와 helper 태그 고정, 4절의 Chart 렌더링을 **준비 서버에서** 먼저 실행하되 `kubectl apply`는 대상 클러스터에서 수행한다. 다운로드 명령과 적용 명령은 나눠 실행한다.
 
 ~~~bash
 cd "$LAB"
 kubeadm config images list --kubernetes-version "$KUBERNETES_VERSION" > images/kubeadm-images.txt
 # .yml, .yaml 모두 포함. local-path ConfigMap 안의 helper 이미지도 포함된다.
 awk '/^[[:space:]]*image:/{gsub(/"/, "", $2); print $2}' \
-  manifests/kube-flannel.yml manifests/local-path-storage.yaml manifests/harbor-rendered.yaml \
+  manifests/kube-flannel.yml manifests/local-path-storage.yaml manifests/metallb-native.yaml manifests/harbor-rendered.yaml \
   > images/addon-harbor-images.txt
 cat images/kubeadm-images.txt images/addon-harbor-images.txt | sort -u > images/all-images.txt
 while IFS= read -r image; do
@@ -675,3 +771,5 @@ Docker load는 Kubernetes의 containerd 이미지 저장소를 채우지 않는�
 - [컨테이너 런타임과 cgroup 설정](https://kubernetes.io/docs/setup/production-environment/container-runtimes/)
 - [Flannel](https://github.com/flannel-io/flannel)
 - [Harbor Chart](https://github.com/goharbor/harbor-helm)
+- [MetalLB 설치](https://metallb.io/installation/)
+- [MetalLB 설정](https://metallb.io/configuration/)
