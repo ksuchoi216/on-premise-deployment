@@ -1,0 +1,29 @@
+# 퍼시스턴트볼륨 정의
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: example-pv
+spec:
+  capacity:
+    storage: 5G		# 스토리지 용량
+  accessModes:
+  - ReadWriteOnce
+  storageClassName: manual
+  csi:
+    # 클러스터에서 이용하는 영구 디스크 지정 예
+    driver: pd.csi.storage.gke.io
+    volumeHandle: projects/k8sdemo-282612/zones/us-west1-a/disks/demo-disk
+    fsType: ext4
+---
+# 퍼시스턴트볼륨클레임 정의
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: example-pvc
+spec:
+  accessModes:
+  - ReadWriteOnce
+  storageClassName: manual
+  resources:
+    requests:
+      storage: 5G		# 스토리지 요청 용량

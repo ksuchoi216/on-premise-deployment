@@ -1,0 +1,20 @@
+apiVersion: apps/v1
+kind: DaemonSet		# 데몬셋으로 각 노드에서 파드를 실행
+metadata:
+  name: ubuntu-daemonset
+spec:
+  selector:
+    matchLabels:
+      app: ubuntu
+  template:
+    metadata:
+      labels:
+        app: ubuntu
+    spec:
+      containers:
+      - name: ubuntu
+        image: ubuntu:22.04
+        command: ["sh"]
+        args:
+        - -euc
+        - "sleep infinity"

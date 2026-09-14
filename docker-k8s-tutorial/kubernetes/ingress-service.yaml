@@ -1,0 +1,29 @@
+# 서비스 정의
+kind: Service
+apiVersion: v1
+metadata:
+  name: nginx-service
+spec:
+  selector:
+    app: nginx      # app: nginx 레이블이 있는 파드에 대해서 서비스 정의
+  ports:
+  - protocol: TCP
+    port: 80        # 서비스가 대기하는 포트
+    targetPort: 80  # 파드가 대기하는 포트
+---
+# 인그레스 정의
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-ingress
+spec:
+  rules:
+  - http:
+      paths:
+      - path: /*    # URL의 /이후의 모든 경로가 대상
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: nginx-service # nginx-service가 접속을 처리
+            port:
+              number: 80

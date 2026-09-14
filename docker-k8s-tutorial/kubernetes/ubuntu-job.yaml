@@ -1,0 +1,17 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: job-example
+spec:
+  completions: 3		# 3개의 파드가 정상 종료하면 잡 성공
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      # 파드명을 출력하고 종료하는 컨테이너
+      - name: test
+        image: ubuntu:22.04
+        command: ["sh"]
+        args:
+        - -euc
+        - "echo done $(hostname)"
